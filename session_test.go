@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alexedwards/scs/v2/memstore"
 )
 
 type testServer struct {
@@ -347,6 +349,146 @@ func TestIterate(t *testing.T) {
 	if err.Error() != "expected error" {
 		t.Fatal("didn't get expected error")
 	}
+}
+
+func TestIterateWithHashedTokens(t *testing.T) {
+	t.Parallel()
+
+	t.Run("destroy removes the hashed session", func(t *testing.T) {
+		sessionManager := New()
+		sessionManager.HashTokenInStore = true
+
+		store := memstore.New()
+		sessionManager.Store = store
+
+		token := "example-client-token"
+		expiry := time.Now().Add(time.Hour)
+		ctx := context.WithValue(context.Background(), sessionManager.ContextKey, &sessionData{
+			deadline: expiry,
+			expiry:   expiry,
+			token:    token,
+			values:   map[string]interface{}{"foo": "bar"},
+		})
+
+		if _, _, err := sessionManager.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, found, err := store.Find(hashToken(token)); err != nil || !found {
+			t.Fatalf("expected session under hashed key, found=%v err=%v", found, err)
+		}
+
+		err := sessionManager.Iterate(context.Background(), func(ctx context.Context) error {
+			return sessionManager.Destroy(ctx)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, found, err := store.Find(hashToken(token)); err != nil || found {
+			t.Fatalf("expected hashed session to be deleted, found=%v err=%v", found, err)
+		}
+
+		if _, found, err := store.Find(hashToken(hashToken(token))); err != nil || found {
+			t.Fatalf("did not expect a double-hashed key, found=%v err=%v", found, err)
+		}
+	})
+
+	t.Run("commit during iteration updates the original hashed session with a valid expiry", func(t *testing.T) {
+		sessionManager := New()
+		sessionManager.HashTokenInStore = true
+
+		store := memstore.NewWithCleanupInterval(0)
+		sessionManager.Store = store
+
+		token := "example-client-token"
+		expiry := time.Now().Add(time.Hour)
+		ctx := context.WithValue(context.Background(), sessionManager.ContextKey, &sessionData{
+			deadline: expiry,
+			expiry:   expiry,
+			token:    token,
+			values:   map[string]interface{}{"foo": "bar"},
+		})
+
+		if _, _, err := sessionManager.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		err := sessionManager.Iterate(context.Background(), func(ctx context.Context) error {
+			sessionManager.Put(ctx, "baz", "qux")
+			_, _, err := sessionManager.Commit(ctx)
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		b, found, err := store.Find(hashToken(token))
+		if err != nil || !found {
+			t.Fatalf("expected original hashed session to remain, found=%v err=%v", found, err)
+		}
+
+		deadline, values, err := sessionManager.Codec.Decode(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deadline.IsZero() {
+			t.Fatal("expected committed session to retain a non-zero deadline")
+		}
+		if values["baz"] != "qux" {
+			t.Fatalf("expected updated values, got %v", values)
+		}
+
+		if _, found, err := store.Find(hashToken(hashToken(token))); err != nil || found {
+			t.Fatalf("did not expect a double-hashed orphan key, found=%v err=%v", found, err)
+		}
+	})
+
+	t.Run("renew during iteration stores the new token under its hash", func(t *testing.T) {
+		sessionManager := New()
+		sessionManager.HashTokenInStore = true
+
+		store := memstore.New()
+		sessionManager.Store = store
+
+		token := "example-client-token"
+		expiry := time.Now().Add(time.Hour)
+		ctx := context.WithValue(context.Background(), sessionManager.ContextKey, &sessionData{
+			deadline: expiry,
+			expiry:   expiry,
+			token:    token,
+			values:   map[string]interface{}{"foo": "bar"},
+		})
+
+		if _, _, err := sessionManager.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		var newToken string
+		err := sessionManager.Iterate(context.Background(), func(ctx context.Context) error {
+			if err := sessionManager.RenewToken(ctx); err != nil {
+				return err
+			}
+			newToken = sessionManager.Token(ctx)
+			_, _, err := sessionManager.Commit(ctx)
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if newToken == "" || newToken == token {
+			t.Fatalf("expected a renewed token, got %q", newToken)
+		}
+
+		if _, found, err := store.Find(hashToken(token)); err != nil || found {
+			t.Fatalf("expected old hashed session to be deleted, found=%v err=%v", found, err)
+		}
+
+		if _, found, err := store.Find(hashToken(newToken)); err != nil || !found {
+			t.Fatalf("expected renewed session under its hashed key, found=%v err=%v", found, err)
+		}
+	})
 }
 
 func TestSetToken(t *testing.T) {

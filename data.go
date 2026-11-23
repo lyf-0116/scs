@@ -40,6 +40,12 @@ type sessionData struct {
 	token    string
 	values   map[string]interface{}
 	mu       sync.Mutex
+	// isStoreKey indicates that token is already the key used in the session
+	// store (rather than the raw client-facing session token). This is true
+	// for sessions reconstructed via Iterate, which returns storage keys from
+	// IterableStore.All. When HashTokenInStore is enabled, these keys must not
+	// be hashed a second time on Find, Commit or Delete.
+	isStoreKey bool
 }
 
 func newSessionData(lifetime, idleTimeout time.Duration) *sessionData {
@@ -83,7 +89,7 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 		return s.addSessionDataToContext(ctx, newSessionData(s.Lifetime, s.IdleTimeout)), nil
 	}
 
-	b, found, err := s.doStoreFind(ctx, token)
+	b, found, err := s.doStoreFind(ctx, token, false)
 	if err != nil {
 		return nil, err
 	} else if !found {
@@ -147,7 +153,7 @@ func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) 
 		return "", time.Time{}, err
 	}
 
-	if err := s.doStoreCommit(ctx, sd.token, b, sd.expiry); err != nil {
+	if err := s.doStoreCommit(ctx, sd.token, b, sd.expiry, sd.isStoreKey); err != nil {
 		return "", time.Time{}, err
 	}
 
@@ -168,7 +174,7 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 	sd.mu.Lock()
 	defer sd.mu.Unlock()
 
-	err := s.doStoreDelete(ctx, sd.token)
+	err := s.doStoreDelete(ctx, sd.token, sd.isStoreKey)
 	if err != nil {
 		return err
 	}
@@ -177,6 +183,7 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 
 	// Reset everything else to defaults.
 	sd.token = ""
+	sd.isStoreKey = false
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
 	for key := range sd.values {
 		delete(sd.values, key)
@@ -325,7 +332,7 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 	defer sd.mu.Unlock()
 
 	if sd.token != "" {
-		err := s.doStoreDelete(ctx, sd.token)
+		err := s.doStoreDelete(ctx, sd.token, sd.isStoreKey)
 		if err != nil {
 			return err
 		}
@@ -337,6 +344,7 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 	}
 
 	sd.token = newToken
+	sd.isStoreKey = false
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
 	sd.status = Modified
 
@@ -349,7 +357,7 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 func (s *SessionManager) MergeSession(ctx context.Context, token string) error {
 	sd := s.getSessionDataFromContext(ctx)
 
-	b, found, err := s.doStoreFind(ctx, token)
+	b, found, err := s.doStoreFind(ctx, token, false)
 	if err != nil {
 		return err
 	} else if !found {
@@ -378,7 +386,7 @@ func (s *SessionManager) MergeSession(ctx context.Context, token string) error {
 	}
 
 	sd.status = Modified
-	return s.doStoreDelete(ctx, token)
+	return s.doStoreDelete(ctx, token, false)
 }
 
 // Status returns the current status of the session data.
@@ -585,14 +593,22 @@ func (s *SessionManager) Iterate(ctx context.Context, fn func(context.Context) e
 
 	for token, b := range allSessions {
 		sd := &sessionData{
-			status: Unmodified,
-			token:  token,
+			status:     Unmodified,
+			token:      token,
+			isStoreKey: true,
 		}
 
 		sd.deadline, sd.values, err = s.Codec.Decode(b)
 		if err != nil {
 			return err
 		}
+
+		// All returns storage keys rather than client tokens, so mark the
+		// session accordingly to prevent re-hashing. Initialize the expiry to
+		// the deadline so a commit made during iteration persists with a valid
+		// lifetime instead of a zero expiry (which stores treat as already
+		// expired).
+		sd.expiry = sd.deadline
 
 		ctx = s.addSessionDataToContext(ctx, sd)
 
@@ -712,8 +728,8 @@ func generateContextKey() contextKey {
 	return contextKey(fmt.Sprintf("session.%d", contextKeyID))
 }
 
-func (s *SessionManager) doStoreDelete(ctx context.Context, token string) (err error) {
-	if s.HashTokenInStore {
+func (s *SessionManager) doStoreDelete(ctx context.Context, token string, alreadyStoreKey bool) (err error) {
+	if s.HashTokenInStore && !alreadyStoreKey {
 		token = hashToken(token)
 	}
 	c, ok := s.Store.(interface {
@@ -725,8 +741,8 @@ func (s *SessionManager) doStoreDelete(ctx context.Context, token string) (err e
 	return s.Store.Delete(token)
 }
 
-func (s *SessionManager) doStoreFind(ctx context.Context, token string) (b []byte, found bool, err error) {
-	if s.HashTokenInStore {
+func (s *SessionManager) doStoreFind(ctx context.Context, token string, alreadyStoreKey bool) (b []byte, found bool, err error) {
+	if s.HashTokenInStore && !alreadyStoreKey {
 		token = hashToken(token)
 	}
 	c, ok := s.Store.(interface {
@@ -738,8 +754,8 @@ func (s *SessionManager) doStoreFind(ctx context.Context, token string) (b []byt
 	return s.Store.Find(token)
 }
 
-func (s *SessionManager) doStoreCommit(ctx context.Context, token string, b []byte, expiry time.Time) (err error) {
-	if s.HashTokenInStore {
+func (s *SessionManager) doStoreCommit(ctx context.Context, token string, b []byte, expiry time.Time, alreadyStoreKey bool) (err error) {
+	if s.HashTokenInStore && !alreadyStoreKey {
 		token = hashToken(token)
 	}
 	c, ok := s.Store.(interface {
