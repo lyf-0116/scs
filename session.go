@@ -172,7 +172,7 @@ func (s *SessionManager) LoadAndSave(next http.Handler) http.Handler {
 			}
 		}
 
-		if s.Status(ctx) == Modified {
+		if sw.commitErr == nil && s.Status(ctx) == Modified {
 			panic(ErrUncommittedModification)
 		}
 	})
@@ -246,31 +246,43 @@ type sessionResponseWriter struct {
 	request         *http.Request
 	sessionManager  *SessionManager
 	responseWritten bool
+	commitErr       error
+}
+
+// commitBeforeWrite persists the session data and adds the session cookie to
+// the response headers before the response is sent to the client. It must be
+// called by every method which causes the response headers to be written
+// (Write, WriteHeader, Flush and Hijack); otherwise a session modified by a
+// streaming handler would be committed to the store without the rotated
+// session cookie ever reaching the client. The responseWritten flag is always
+// set, so a commit failure does not trigger the LoadAndSave panic on the way
+// out; the caller is responsible for surfacing the returned error.
+func (sw *sessionResponseWriter) commitBeforeWrite() error {
+	if sw.responseWritten {
+		return nil
+	}
+
+	sw.responseWritten = true
+
+	sw.commitErr = sw.sessionManager.commitAndAddSessionCookie(sw.ResponseWriter, sw.request)
+	return sw.commitErr
 }
 
 func (sw *sessionResponseWriter) Write(b []byte) (int, error) {
-	if !sw.responseWritten {
-		sw.responseWritten = true
-
-		err := sw.sessionManager.commitAndAddSessionCookie(sw.ResponseWriter, sw.request)
-		if err != nil {
-			sw.sessionManager.ErrorFunc(sw.ResponseWriter, sw.request, err)
-			return 0, nil
-		}
+	err := sw.commitBeforeWrite()
+	if err != nil {
+		sw.sessionManager.ErrorFunc(sw.ResponseWriter, sw.request, err)
+		return 0, nil
 	}
 
 	return sw.ResponseWriter.Write(b)
 }
 
 func (sw *sessionResponseWriter) WriteHeader(code int) {
-	if !sw.responseWritten {
-		sw.responseWritten = true
-
-		err := sw.sessionManager.commitAndAddSessionCookie(sw.ResponseWriter, sw.request)
-		if err != nil {
-			sw.sessionManager.ErrorFunc(sw.ResponseWriter, sw.request, err)
-			return
-		}
+	err := sw.commitBeforeWrite()
+	if err != nil {
+		sw.sessionManager.ErrorFunc(sw.ResponseWriter, sw.request, err)
+		return
 	}
 
 	sw.ResponseWriter.WriteHeader(code)
