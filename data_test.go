@@ -948,3 +948,151 @@ func TestSetDeadlineHonoursIdleTimeout(t *testing.T) {
 		t.Fatalf("Expiry() = %v; want before %v", got, deadline)
 	}
 }
+
+func TestRenewTokenResetsExpiry(t *testing.T) {
+	t.Parallel()
+
+	t.Run("without idle timeout", func(t *testing.T) {
+		t.Parallel()
+
+		s := New()
+		s.Lifetime = time.Hour
+
+		oldDeadline := time.Now().Add(time.Second)
+		ctx := s.addSessionDataToContext(context.Background(), &sessionData{
+			deadline: oldDeadline,
+			expiry:   oldDeadline,
+			token:    "old-token",
+			values:   map[string]interface{}{"foo": "bar"},
+		})
+
+		if err := s.RenewToken(ctx); err != nil {
+			t.Fatalf("RenewToken() error: %v", err)
+		}
+
+		deadline := s.Deadline(ctx)
+		if !deadline.After(oldDeadline) {
+			t.Fatalf("deadline = %v; want after %v", deadline, oldDeadline)
+		}
+		if got := s.Expiry(ctx); !got.Equal(deadline) {
+			t.Fatalf("Expiry() = %v; want %v", got, deadline)
+		}
+
+		token, expiry, err := s.Commit(ctx)
+		if err != nil {
+			t.Fatalf("Commit() error: %v", err)
+		}
+		if token == "old-token" {
+			t.Fatal("expected token to be rotated")
+		}
+		if !expiry.Equal(deadline) {
+			t.Fatalf("Commit() expiry = %v; want %v", expiry, deadline)
+		}
+
+		loaded, err := s.Load(context.Background(), token)
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if got := s.GetString(loaded, "foo"); got != "bar" {
+			t.Fatalf("GetString() = %q; want %q", got, "bar")
+		}
+	})
+
+	t.Run("with idle timeout", func(t *testing.T) {
+		t.Parallel()
+
+		s := New()
+		s.Lifetime = time.Hour
+		s.IdleTimeout = time.Minute
+
+		oldDeadline := time.Now().Add(time.Second)
+		ctx := s.addSessionDataToContext(context.Background(), &sessionData{
+			deadline: oldDeadline,
+			expiry:   oldDeadline,
+			token:    "old-token",
+			values:   map[string]interface{}{"foo": "bar"},
+		})
+
+		if err := s.RenewToken(ctx); err != nil {
+			t.Fatalf("RenewToken() error: %v", err)
+		}
+
+		deadline := s.Deadline(ctx)
+		if got := s.Expiry(ctx); !got.Before(deadline) {
+			t.Fatalf("Expiry() = %v; want before %v", got, deadline)
+		}
+
+		_, expiry, err := s.Commit(ctx)
+		if err != nil {
+			t.Fatalf("Commit() error: %v", err)
+		}
+		if !expiry.Equal(s.Expiry(ctx)) {
+			t.Fatalf("Commit() expiry = %v; want %v", expiry, s.Expiry(ctx))
+		}
+	})
+}
+
+func TestDestroyResetsExpiry(t *testing.T) {
+	t.Parallel()
+
+	t.Run("without idle timeout", func(t *testing.T) {
+		t.Parallel()
+
+		s := New()
+		s.Lifetime = time.Hour
+
+		oldDeadline := time.Now().Add(time.Second)
+		ctx := s.addSessionDataToContext(context.Background(), &sessionData{
+			deadline: oldDeadline,
+			expiry:   oldDeadline,
+			token:    "old-token",
+			values:   map[string]interface{}{"foo": "bar"},
+		})
+
+		if err := s.Destroy(ctx); err != nil {
+			t.Fatalf("Destroy() error: %v", err)
+		}
+
+		deadline := s.Deadline(ctx)
+		if !deadline.After(oldDeadline) {
+			t.Fatalf("deadline = %v; want after %v", deadline, oldDeadline)
+		}
+		if got := s.Expiry(ctx); !got.Equal(deadline) {
+			t.Fatalf("Expiry() = %v; want %v", got, deadline)
+		}
+
+		s.Put(ctx, "baz", "qux")
+		_, expiry, err := s.Commit(ctx)
+		if err != nil {
+			t.Fatalf("Commit() error: %v", err)
+		}
+		if !expiry.Equal(deadline) {
+			t.Fatalf("Commit() expiry = %v; want %v", expiry, deadline)
+		}
+	})
+
+	t.Run("with idle timeout", func(t *testing.T) {
+		t.Parallel()
+
+		s := New()
+		s.Lifetime = time.Hour
+		s.IdleTimeout = time.Minute
+
+		oldDeadline := time.Now().Add(time.Second)
+		ctx := s.addSessionDataToContext(context.Background(), &sessionData{
+			deadline: oldDeadline,
+			expiry:   oldDeadline,
+			token:    "old-token",
+			values:   map[string]interface{}{"foo": "bar"},
+		})
+
+		if err := s.Destroy(ctx); err != nil {
+			t.Fatalf("Destroy() error: %v", err)
+		}
+
+		deadline := s.Deadline(ctx)
+		if got := s.Expiry(ctx); !got.Before(deadline) {
+			t.Fatalf("Expiry() = %v; want before %v", got, deadline)
+		}
+	})
+}

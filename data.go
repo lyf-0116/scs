@@ -48,17 +48,25 @@ func newSessionData(lifetime, idleTimeout time.Duration) *sessionData {
 
 	sd := sessionData{
 		deadline: deadline,
-		expiry:   deadline,
+		expiry:   calculateExpiry(deadline, idleTimeout),
 		status:   Unmodified,
 		values:   make(map[string]interface{}),
 	}
 
-	if idleTimeout > 0 {
-		idleExpiry := time.Now().Add(idleTimeout).UTC()
-		sd.expiry = minTime(sd.deadline, idleExpiry)
-	}
-
 	return &sd
+}
+
+// calculateExpiry returns the storage expiry for a session with the given
+// absolute deadline. When an idle timeout is set, the expiry is whichever
+// comes first between the deadline and the idle timeout measured from now.
+// It is the single source of truth for deriving the storage expiry from the
+// deadline and IdleTimeout.
+func calculateExpiry(deadline time.Time, idleTimeout time.Duration) time.Time {
+	if idleTimeout <= 0 {
+		return deadline
+	}
+	idleExpiry := time.Now().Add(idleTimeout).UTC()
+	return minTime(deadline, idleExpiry)
 }
 
 func minTime(a, b time.Time) time.Time {
@@ -107,17 +115,12 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 		return s.addSessionDataToContext(ctx, newSessionData(s.Lifetime, s.IdleTimeout)), nil
 	}
 
-	// By default, set the expiry time to the deadline.
-	sd.expiry = sd.deadline
-
 	// If an idle timeout is being used, set the expiry to whichever comes first
 	// between the session deadline and idleTimeout expiry. We also set the status
 	// to Modified, which will force the session data to be re-committed to the
 	// session store with the updated new expiry time.
+	sd.expiry = calculateExpiry(sd.deadline, s.IdleTimeout)
 	if s.IdleTimeout > 0 {
-		idleExpiry := time.Now().Add(s.IdleTimeout).UTC()
-
-		sd.expiry = minTime(sd.deadline, idleExpiry)
 		sd.status = Modified
 	}
 
@@ -178,6 +181,7 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 	// Reset everything else to defaults.
 	sd.token = ""
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
+	sd.expiry = calculateExpiry(sd.deadline, s.IdleTimeout)
 	for key := range sd.values {
 		delete(sd.values, key)
 	}
@@ -338,6 +342,7 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 
 	sd.token = newToken
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
+	sd.expiry = calculateExpiry(sd.deadline, s.IdleTimeout)
 	sd.status = Modified
 
 	return nil
@@ -627,11 +632,7 @@ func (s *SessionManager) SetDeadline(ctx context.Context, expire time.Time) {
 	defer sd.mu.Unlock()
 
 	sd.deadline = expire
-	if s.IdleTimeout > 0 {
-		sd.expiry = minTime(expire, time.Now().Add(s.IdleTimeout).UTC())
-	} else {
-		sd.expiry = expire
-	}
+	sd.expiry = calculateExpiry(expire, s.IdleTimeout)
 	sd.status = Modified
 }
 
