@@ -12,8 +12,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/alexedwards/scs/v2/memstore"
 )
 
 type testServer struct {
@@ -213,6 +216,84 @@ func TestDestroy(t *testing.T) {
 	_, body := ts.execute(t, "/get")
 	if body != "foo does not exist in session\n" {
 		t.Errorf("want %q; got %q", "foo does not exist in session\n", body)
+	}
+}
+
+type regressionDeleteFailureStore struct {
+	*memstore.MemStore
+	commits int64
+}
+
+func (s *regressionDeleteFailureStore) Commit(token string, b []byte, expiry time.Time) error {
+	atomic.AddInt64(&s.commits, 1)
+	return s.MemStore.Commit(token, b, expiry)
+}
+
+func (s *regressionDeleteFailureStore) Delete(token string) error {
+	return errors.New("store unavailable")
+}
+
+func TestRegressionDestroyFailureDoesNotRenewSession(t *testing.T) {
+	t.Parallel()
+
+	sessionManager := New()
+	sessionManager.IdleTimeout = time.Hour
+
+	store := &regressionDeleteFailureStore{MemStore: memstore.New()}
+	defer store.StopCleanup()
+	sessionManager.Store = store
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/put", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sessionManager.Put(r.Context(), "foo", "bar")
+	}))
+	mux.HandleFunc("/destroy", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := sessionManager.Destroy(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}))
+	mux.HandleFunc("/get", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sessionManager.GetString(r.Context(), "foo") == "" {
+			w.Write([]byte("missing"))
+			return
+		}
+		w.Write([]byte("present"))
+	}))
+
+	ts := newTestServer(t, sessionManager.LoadAndSave(mux))
+	defer ts.Close()
+
+	header, _ := ts.execute(t, "/put")
+	token := extractTokenFromCookie(header.Get("Set-Cookie"))
+	commitsAfterPut := atomic.LoadInt64(&store.commits)
+
+	header, _ = ts.execute(t, "/destroy")
+	cookie := header.Get("Set-Cookie")
+	if strings.HasPrefix(cookie, fmt.Sprintf("%s=;", sessionManager.Cookie.Name)) == false {
+		t.Fatalf("got %q: expected deleted session cookie", cookie)
+	}
+	if got := atomic.LoadInt64(&store.commits); got != commitsAfterPut {
+		t.Fatalf("Destroy() committed the session again: got %d commits; want %d", got, commitsAfterPut)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/get", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(&http.Cookie{Name: sessionManager.Cookie.Name, Value: token})
+
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "missing" {
+		t.Fatalf("revoked token loaded session data: got %q", body)
 	}
 }
 

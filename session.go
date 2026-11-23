@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/alexedwards/scs/v2/memstore"
@@ -55,6 +56,9 @@ type SessionManager struct {
 	// context.Context. If you are setting this manually, please make sure it is
 	// a unique value for each SessionManager instance
 	ContextKey contextKey
+
+	revokedTokensMu sync.Mutex
+	revokedTokens   map[string]time.Time
 }
 
 // SessionCookie contains the configuration settings for session cookies.

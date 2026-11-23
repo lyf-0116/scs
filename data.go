@@ -170,7 +170,7 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 
 	err := s.doStoreDelete(ctx, sd.token)
 	if err != nil {
-		return err
+		s.revokeToken(sd.token, sd.deadline)
 	}
 
 	sd.status = Destroyed
@@ -178,11 +178,15 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 	// Reset everything else to defaults.
 	sd.token = ""
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
+	sd.expiry = sd.deadline
+	if s.IdleTimeout > 0 {
+		sd.expiry = minTime(sd.deadline, time.Now().Add(s.IdleTimeout).UTC())
+	}
 	for key := range sd.values {
 		delete(sd.values, key)
 	}
 
-	return nil
+	return err
 }
 
 // Put adds a key and corresponding value to the session data. Any existing
@@ -584,6 +588,10 @@ func (s *SessionManager) Iterate(ctx context.Context, fn func(context.Context) e
 	}
 
 	for token, b := range allSessions {
+		if s.tokenRevoked(token) {
+			continue
+		}
+
 		sd := &sessionData{
 			status: Unmodified,
 			token:  token,
@@ -726,6 +734,10 @@ func (s *SessionManager) doStoreDelete(ctx context.Context, token string) (err e
 }
 
 func (s *SessionManager) doStoreFind(ctx context.Context, token string) (b []byte, found bool, err error) {
+	if s.tokenRevoked(token) {
+		return nil, false, nil
+	}
+
 	if s.HashTokenInStore {
 		token = hashToken(token)
 	}
@@ -736,6 +748,55 @@ func (s *SessionManager) doStoreFind(ctx context.Context, token string) (b []byt
 		return c.FindCtx(ctx, token)
 	}
 	return s.Store.Find(token)
+}
+
+func (s *SessionManager) revokeToken(token string, expiry time.Time) {
+	if token == "" {
+		return
+	}
+
+	now := time.Now()
+	if expiry.IsZero() || !expiry.After(now) {
+		expiry = now.Add(s.Lifetime)
+	}
+
+	s.revokedTokensMu.Lock()
+	defer s.revokedTokensMu.Unlock()
+
+	if s.revokedTokens == nil {
+		s.revokedTokens = make(map[string]time.Time)
+	}
+
+	for revokedToken, revokedExpiry := range s.revokedTokens {
+		if !revokedExpiry.After(now) {
+			delete(s.revokedTokens, revokedToken)
+		}
+	}
+
+	s.revokedTokens[token] = expiry
+}
+
+func (s *SessionManager) tokenRevoked(token string) bool {
+	if token == "" {
+		return false
+	}
+
+	now := time.Now()
+
+	s.revokedTokensMu.Lock()
+	defer s.revokedTokensMu.Unlock()
+
+	expiry, ok := s.revokedTokens[token]
+	if !ok {
+		return false
+	}
+
+	if !expiry.After(now) {
+		delete(s.revokedTokens, token)
+		return false
+	}
+
+	return true
 }
 
 func (s *SessionManager) doStoreCommit(ctx context.Context, token string, b []byte, expiry time.Time) (err error) {

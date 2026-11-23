@@ -854,6 +854,46 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+func TestRegressionDestroyFailureRevokesSession(t *testing.T) {
+	t.Parallel()
+
+	s := New()
+	store := &mockstore.MockStore{}
+	s.Store = store
+
+	expectedErr := errors.New("store unavailable")
+	sd := newSessionData(time.Hour, time.Minute)
+	sd.token = "example"
+	sd.values["foo"] = "bar"
+	ctx := s.addSessionDataToContext(context.Background(), sd)
+
+	store.ExpectDelete(sd.token, expectedErr)
+
+	if err := s.Destroy(ctx); !errors.Is(err, expectedErr) {
+		t.Fatalf("Destroy() error = %v; want %v", err, expectedErr)
+	}
+	if got := s.Status(ctx); got != Destroyed {
+		t.Fatalf("Status() = %v; want %v", got, Destroyed)
+	}
+	if got := s.Token(ctx); got != "" {
+		t.Fatalf("Token() = %q; want empty", got)
+	}
+	if got := s.Keys(ctx); len(got) != 0 {
+		t.Fatalf("Keys() = %v; want empty", got)
+	}
+
+	loaded, err := s.Load(context.Background(), "example")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got := s.Token(loaded); got != "" {
+		t.Fatalf("revoked token was restored: %q", got)
+	}
+	if got := s.GetString(loaded, "foo"); got != "" {
+		t.Fatalf("revoked session data was restored: %q", got)
+	}
+}
+
 func TestDeadlineAndExpiry(t *testing.T) {
 	t.Parallel()
 
